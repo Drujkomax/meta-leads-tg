@@ -1,106 +1,130 @@
+import { createServer } from 'node:http';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
 const GRAPH_API = 'https://graph.facebook.com/v22.0';
+const PORT = Number(process.env.PORT) || 3000;
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (request.method === 'GET' && url.pathname === '/health') {
-      return new Response('ok', { status: 200 });
-    }
-
-    if (request.method === 'GET' && url.pathname === '/webhook') {
-      return verifyWebhook(url, env);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/webhook') {
-      return handleWebhook(request, env, ctx);
-    }
-
-    return new Response('not found', { status: 404 });
-  },
+const env = {
+  META_VERIFY_TOKEN: process.env.META_VERIFY_TOKEN,
+  META_APP_SECRET: process.env.META_APP_SECRET,
+  META_PAGE_ACCESS_TOKEN: process.env.META_PAGE_ACCESS_TOKEN,
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+  TELEGRAM_PERSONAL_CHAT_ID: process.env.TELEGRAM_PERSONAL_CHAT_ID,
+  TELEGRAM_GROUP_CHAT_ID: process.env.TELEGRAM_GROUP_CHAT_ID,
 };
 
-function verifyWebhook(url, env) {
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return send(res, 200, 'ok');
+    }
+
+    if (req.method === 'GET' && url.pathname === '/webhook') {
+      return verifyWebhook(url, res);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/webhook') {
+      return handleWebhook(req, res);
+    }
+
+    return send(res, 404, 'not found');
+  } catch (err) {
+    console.log('handler error', err.stack || String(err));
+    return send(res, 500, 'internal error');
+  }
+});
+
+function send(res, status, body) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'text/plain; charset=utf-8');
+  res.end(body);
+}
+
+function verifyWebhook(url, res) {
   const mode = url.searchParams.get('hub.mode');
   const token = url.searchParams.get('hub.verify_token');
   const challenge = url.searchParams.get('hub.challenge');
 
   if (mode === 'subscribe' && token === env.META_VERIFY_TOKEN) {
-    return new Response(challenge, { status: 200 });
+    return send(res, 200, challenge ?? '');
   }
-  return new Response('forbidden', { status: 403 });
+  return send(res, 403, 'forbidden');
 }
 
-async function handleWebhook(request, env, ctx) {
-  const rawBody = await request.text();
+async function handleWebhook(req, res) {
+  const rawBody = await readBody(req);
 
-  const valid = await verifySignature(rawBody, request.headers.get('x-hub-signature-256'), env.META_APP_SECRET);
+  const valid = verifySignature(rawBody, req.headers['x-hub-signature-256'], env.META_APP_SECRET);
   if (!valid) {
     console.log('signature verification failed');
-    return new Response('forbidden', { status: 403 });
+    return send(res, 403, 'forbidden');
   }
 
   let payload;
   try {
     payload = JSON.parse(rawBody);
   } catch {
-    return new Response('bad json', { status: 400 });
+    return send(res, 400, 'bad json');
   }
 
-  ctx.waitUntil(processPayload(payload, env));
-  return new Response('ok', { status: 200 });
+  processPayload(payload).catch((err) => {
+    console.log('processPayload failed', err.stack || String(err));
+  });
+
+  return send(res, 200, 'ok');
 }
 
-async function verifySignature(rawBody, signatureHeader, appSecret) {
-  if (!signatureHeader || !signatureHeader.startsWith('sha256=')) return false;
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function verifySignature(rawBody, signatureHeader, appSecret) {
+  if (!signatureHeader || !signatureHeader.startsWith('sha256=') || !appSecret) return false;
   const expected = signatureHeader.slice(7);
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(appSecret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rawBody));
-  const hex = Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
-  return timingSafeEqual(hex, expected);
+  const computed = createHmac('sha256', appSecret).update(rawBody).digest('hex');
+  if (computed.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(computed, 'utf8'), Buffer.from(expected, 'utf8'));
+  } catch {
+    return false;
+  }
 }
 
-function timingSafeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-async function processPayload(payload, env) {
+async function processPayload(payload) {
   if (payload.object !== 'page') return;
   for (const entry of payload.entry || []) {
     for (const change of entry.changes || []) {
       if (change.field !== 'leadgen') continue;
       const v = change.value;
       try {
-        await processLead(v, env);
+        await processLead(v);
       } catch (err) {
         console.log('processLead failed', err.stack || String(err));
-        await sendTelegramSafe(env, `⚠️ Ошибка при обработке лида ${v?.leadgen_id}: ${String(err).slice(0, 300)}`);
+        await sendTelegramSafe(`⚠️ Ошибка при обработке лида ${v?.leadgen_id}: ${String(err).slice(0, 300)}`);
       }
     }
   }
 }
 
-async function processLead(value, env) {
+async function processLead(value) {
   const leadgenId = value.leadgen_id;
   if (!leadgenId) throw new Error('no leadgen_id in payload');
 
   const lead = await graphGet(`/${leadgenId}`, {
     fields: 'id,created_time,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,form_id,field_data,is_organic,platform',
-  }, env);
+  });
 
   let formName = null;
   if (lead.form_id) {
     try {
-      const form = await graphGet(`/${lead.form_id}`, { fields: 'name' }, env);
+      const form = await graphGet(`/${lead.form_id}`, { fields: 'name' });
       formName = form.name;
     } catch (err) {
       console.log('form name fetch failed', String(err));
@@ -108,17 +132,16 @@ async function processLead(value, env) {
   }
 
   const message = formatLeadMessage(lead, formName);
-  await Promise.allSettled([
-    sendTelegram(env, env.TELEGRAM_PERSONAL_CHAT_ID, message),
-    sendTelegram(env, env.TELEGRAM_GROUP_CHAT_ID, message),
-  ]).then((results) => {
-    results.forEach((r, i) => {
-      if (r.status === 'rejected') console.log(`telegram send #${i} failed`, String(r.reason));
-    });
+  const results = await Promise.allSettled([
+    sendTelegram(env.TELEGRAM_PERSONAL_CHAT_ID, message),
+    sendTelegram(env.TELEGRAM_GROUP_CHAT_ID, message),
+  ]);
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') console.log(`telegram send #${i} failed`, String(r.reason));
   });
 }
 
-async function graphGet(path, params, env) {
+async function graphGet(path, params) {
   const u = new URL(GRAPH_API + path);
   for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, v);
   u.searchParams.set('access_token', env.META_PAGE_ACCESS_TOKEN);
@@ -190,7 +213,7 @@ function formatLeadMessage(lead, formName) {
   return lines.join('\n');
 }
 
-async function sendTelegram(env, chatId, text) {
+async function sendTelegram(chatId, text) {
   if (!chatId) return;
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
@@ -208,10 +231,14 @@ async function sendTelegram(env, chatId, text) {
   }
 }
 
-async function sendTelegramSafe(env, text) {
+async function sendTelegramSafe(text) {
   try {
-    await sendTelegram(env, env.TELEGRAM_PERSONAL_CHAT_ID, text);
+    await sendTelegram(env.TELEGRAM_PERSONAL_CHAT_ID, text);
   } catch (err) {
     console.log('alert send failed', String(err));
   }
 }
+
+server.listen(PORT, () => {
+  console.log(`meta-leads-tg listening on :${PORT}`);
+});
