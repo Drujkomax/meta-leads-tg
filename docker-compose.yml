@@ -1,0 +1,10 @@
+services:
+  meta-leads-tg:
+    build: .
+    image: meta-leads-tg:latest
+    container_name: meta-leads-tg
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
